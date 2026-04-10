@@ -422,7 +422,7 @@ function goRead() {
 }
 
 // ── DOTS ──
-const STRAT_LABELS = ['Jina Reader', '12ft.io', 'Wayback Machine', 'Archive.ph'];
+const STRAT_LABELS = ['Jina Reader','Outline.com','12ft.io','Google Cache','Wayback Machine','Archive.ph','AMP Cache'];
 let dotEls = [];
 function initDots() {
   const w = $('strat-dots'); w.innerHTML = ''; dotEls = [];
@@ -506,50 +506,51 @@ function esc(s) {
           .replace(/`(.+?)`/g,'<code>$1</code>');
 }
 
-// ── Strategy 0: Jina AI Reader (primary — handles paywalls) ──
-async function stratJina(url) {
-  // r.jina.ai accepts any URL and returns clean text
-  // X-Return-Format: text gives plain text; default gives markdown
-  const jinaUrl = `https://r.jina.ai/${url}`;
-  const res = await fetch(jinaUrl, {
-    signal: AbortSignal.timeout(25000),
-    headers: {
-      'Accept': 'text/plain,text/markdown,*/*',
-      'X-Return-Format': 'markdown',
-      'X-Timeout': '20'
-    }
-  });
-  if (!res.ok) throw new Error(`Jina ${res.status}`);
-  const text = await res.text();
-  if (!text || text.length < 300) throw new Error('Jina: content too short');
-
-  // Check if Jina returned an error page
-  if (text.includes('Error:') && text.length < 500) throw new Error('Jina: ' + text.slice(0, 100));
-
-  const art = parseJinaResponse(text, url);
-  if (!art) throw new Error('Jina: parse failed');
-  return art;
-}
-
-// ── Strategy 1: 12ft.io via Jina (paywall bypass + extraction) ──
-async function strat12ftJina(url) {
-  const target = `https://12ft.io/proxy?q=${encodeURIComponent(url)}`;
-  const jinaUrl = `https://r.jina.ai/${target}`;
-  const res = await fetch(jinaUrl, {
+// ═══════════════════════════════════════════════
+// JINA FETCH HELPER — used by all strategies
+// ═══════════════════════════════════════════════
+async function jinaFetch(targetUrl, sourceUrl) {
+  const res = await fetch(`https://r.jina.ai/${targetUrl}`, {
     signal: AbortSignal.timeout(25000),
     headers: { 'X-Return-Format': 'markdown', 'X-Timeout': '20' }
   });
-  if (!res.ok) throw new Error(`12ft+Jina ${res.status}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const text = await res.text();
-  if (!text || text.length < 300) throw new Error('12ft+Jina: too short');
-  const art = parseJinaResponse(text, url);
-  if (!art) throw new Error('12ft+Jina: parse failed');
+  if (!text || text.length < 200) throw new Error('empty response');
+  if (/^(Error|Access Denied|403|404)/i.test(text.slice(0,60))) throw new Error('blocked');
+  const art = parseJinaResponse(text, sourceUrl || targetUrl);
+  if (!art) throw new Error('parse failed');
   return art;
 }
 
-// ── Strategy 2: Wayback Machine via Jina ──
+// Word count of article content
+function wordCount(art) {
+  return (art.content || '').split(/\s+/).filter(Boolean).length;
+}
+
+// ── Strategy 0: Direct Jina (handles soft paywalls) ──
+async function stratJina(url) {
+  return jinaFetch(url, url);
+}
+
+// ── Strategy 1: Outline.com (reliable for NYT, Bloomberg, Economist) ──
+async function stratOutline(url) {
+  return jinaFetch(`https://outline.com/${url}`, url);
+}
+
+// ── Strategy 2: 12ft.io via Jina ──
+async function strat12ft(url) {
+  return jinaFetch(`https://12ft.io/proxy?q=${encodeURIComponent(url)}`, url);
+}
+
+// ── Strategy 3: Google Cache via Jina ──
+async function stratGoogleCache(url) {
+  const cacheUrl = `https://webcache.googleusercontent.com/search?q=cache:${encodeURIComponent(url)}&hl=en&strip=0`;
+  return jinaFetch(cacheUrl, url);
+}
+
+// ── Strategy 4: Wayback Machine via Jina ──
 async function stratWayback(url) {
-  // Get latest snapshot
   const apiRes = await fetch(
     `https://archive.org/wayback/available?url=${encodeURIComponent(url)}`,
     { signal: AbortSignal.timeout(8000) }
@@ -557,76 +558,116 @@ async function stratWayback(url) {
   if (!apiRes.ok) throw new Error('Wayback API fail');
   const json = await apiRes.json();
   const snap = json?.archived_snapshots?.closest?.url;
-  if (!snap) throw new Error('No Wayback snapshot');
-
-  const jinaUrl = `https://r.jina.ai/${snap}`;
-  const res = await fetch(jinaUrl, {
-    signal: AbortSignal.timeout(25000),
-    headers: { 'X-Return-Format': 'markdown', 'X-Timeout': '20' }
-  });
-  if (!res.ok) throw new Error(`Wayback+Jina ${res.status}`);
-  const text = await res.text();
-  if (!text || text.length < 300) throw new Error('Wayback: too short');
-  const art = parseJinaResponse(text, url);
-  if (!art) throw new Error('Wayback: parse failed');
-  return art;
+  if (!snap) throw new Error('No snapshot');
+  return jinaFetch(snap, url);
 }
 
-// ── Strategy 3: Archive.ph via Jina ──
+// ── Strategy 5: Archive.ph newest ──
 async function stratArchivePh(url) {
-  const archiveUrl = `https://archive.ph/newest/${url}`;
-  const jinaUrl = `https://r.jina.ai/${archiveUrl}`;
-  const res = await fetch(jinaUrl, {
-    signal: AbortSignal.timeout(25000),
-    headers: { 'X-Return-Format': 'markdown', 'X-Timeout': '20' }
-  });
-  if (!res.ok) throw new Error(`ArchivePh+Jina ${res.status}`);
-  const text = await res.text();
-  if (!text || text.length < 300) throw new Error('Archive.ph: too short');
-  const art = parseJinaResponse(text, url);
-  if (!art) throw new Error('Archive.ph: parse failed');
-  return art;
+  return jinaFetch(`https://archive.ph/newest/${url}`, url);
 }
 
-// ── PIPELINE ──
+// ── Strategy 6: Google AMP cache (for supported publishers) ──
+async function stratAMP(url) {
+  const u = new URL(url);
+  const ampDomain = u.hostname.replace(/\./g,'-');
+  const ampUrl = `https://${ampDomain}.cdn.ampproject.org/c/s/${u.hostname}${u.pathname}${u.search}`;
+  return jinaFetch(ampUrl, url);
+}
+
+// ─────────────────────────────────────────────
+// PIPELINE
+// Full articles need >300 words.
+// If a strategy gets some content (>80 words) but not full,
+// we keep it as a "best partial" and keep trying.
+// ─────────────────────────────────────────────
 const strategies = [
-  { label: 'Jina Reader',    fn: stratJina },
-  { label: '12ft.io',        fn: strat12ftJina },
-  { label: 'Wayback Machine',fn: stratWayback },
-  { label: 'Archive.ph',     fn: stratArchivePh },
+  { label: 'Jina Reader',     fn: stratJina },
+  { label: 'Outline.com',     fn: stratOutline },
+  { label: '12ft.io',         fn: strat12ft },
+  { label: 'Google Cache',    fn: stratGoogleCache },
+  { label: 'Wayback Machine', fn: stratWayback },
+  { label: 'Archive.ph',      fn: stratArchivePh },
+  { label: 'AMP Cache',       fn: stratAMP },
 ];
+
+const FULL_THRESHOLD    = 300;  // words — treat as full article
+const PARTIAL_THRESHOLD = 60;   // words — worth showing as preview
 
 async function fetchArticle(url) {
   initDots();
+  let bestPartial = null;
+  let bestWords   = 0;
+
   for (let i = 0; i < strategies.length; i++) {
     const { label, fn } = strategies[i];
     dotTry(i);
-    goLoad(`Fetching article… (${i+1}/${strategies.length})`, label);
+    goLoad(`Trying ${label}…`, `Strategy ${i+1} of ${strategies.length}`);
     try {
       const art = await fn(url);
+      const wc  = wordCount(art);
       dotOk(i);
-      return art;
+
+      if (wc >= FULL_THRESHOLD) {
+        // Full article — done
+        art._partial = false;
+        return art;
+      }
+      // Partial — keep as best so far, try next
+      if (wc > bestWords) { bestPartial = art; bestWords = wc; }
     } catch(e) {
       dotFail(i);
-      await new Promise(r => setTimeout(r, 300));
     }
+    await new Promise(r => setTimeout(r, 200));
   }
-  throw new Error('All strategies failed. This article requires a subscription that cannot be bypassed.');
+
+  // All failed — return best partial if we got anything
+  if (bestPartial && bestWords >= PARTIAL_THRESHOLD) {
+    bestPartial._partial = true;
+    return bestPartial;
+  }
+
+  throw new Error('This article is behind a hard paywall that cannot be bypassed from a browser. The Economist, FT, and WSJ require an active subscription.');
 }
 
-// ── RENDER ──
+// ─────────────────────────────────────────────
+// RENDER
+// ─────────────────────────────────────────────
 function render(art, url) {
   try { $('art-src').textContent = (art.site || new URL(url).hostname.replace('www.','')).toUpperCase(); } catch(e) {}
-  $('art-title').textContent = art.title  || 'Article';
-  $('mini-ttl').textContent  = art.title  || '';
+  $('art-title').textContent = art.title || 'Article';
+  $('mini-ttl').textContent  = art.title || '';
 
   const body = $('art-body');
   body.innerHTML = markdownToHtml(art.content || '');
 
-  // Word count
-  const words    = body.textContent.trim().split(/\s+/).length;
-  const readMins = Math.ceil(words / 200);
-  $('art-meta').textContent = [art.byline, `${readMins} min read`, `${words.toLocaleString()} words`].filter(Boolean).join(' · ');
+  const wc       = body.textContent.trim().split(/\s+/).length;
+  const readMins = Math.ceil(wc / 200);
+  $('art-meta').textContent = [art.byline, `${readMins} min read`, `${wc.toLocaleString()} words`].filter(Boolean).join(' · ');
+
+  // Paywall / partial notice
+  const existingNotice = $('paywall-notice');
+  if (existingNotice) existingNotice.remove();
+  if (art._partial) {
+    const notice = document.createElement('div');
+    notice.id = 'paywall-notice';
+    notice.style.cssText = [
+      'margin-top:32px','padding:16px 18px','border-radius:12px',
+      'background:var(--bg2)','border:1px solid var(--border2)',
+      'font-family:Geist,sans-serif','font-size:14px',
+      'color:var(--text2)','line-height:1.6'
+    ].join(';');
+    notice.innerHTML = `
+      <div style="font-weight:500;color:var(--text);margin-bottom:6px;">🔒 Preview only — paywall detected</div>
+      This article is behind a subscription paywall. NewsWala extracted what's publicly visible.
+      <div style="margin-top:10px;">
+        <a href="${url}" target="_blank" rel="noopener"
+           style="color:var(--accent);text-decoration:none;font-weight:500;">
+          Read full article on ${(art.site||'publisher website')} ↗
+        </a>
+      </div>`;
+    body.appendChild(notice);
+  }
 
   buildTTS();
   goRead();
