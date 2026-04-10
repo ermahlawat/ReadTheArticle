@@ -441,29 +441,114 @@ function dotFail(i) { if(dotEls[i]) dotEls[i].className='dot fail'; }
 // handles paywalls, proper CORS headers.
 // ═══════════════════════════════════════════════
 
-// Parse Markdown-ish text from Jina into structured article
+// ─────────────────────────────────────────────
+// CLEAN RAW JINA MARKDOWN
+// Strips tracking pixels, nav links, footer
+// junk, subscription walls, and empty lines
+// ─────────────────────────────────────────────
+function cleanJinaContent(text) {
+  const JUNK_DOMAINS = [
+    't.teads.tv','t.co/i/adsct','analytics.twitter.com',
+    'bat.bing.com','verifi.podscribe.com','cdn-cgi',
+    'facebook.com','twitter.com','linkedin.com',
+    'tiktok.com','youtube.com','instagram.com',
+    'whatsapp.com','apps.apple.com','play.google.com',
+    'doubleclick','googlesyndication','amazon-adsystem',
+    'scorecardresearch','quantserve','pixel'
+  ];
+
+  // Paywall / subscription phrases that signal end of real content
+  const PAYWALL_SIGNALS = [
+    /already have an account/i,
+    /subscribe (to|now|for)/i,
+    /\bcreate (a )?free account\b/i,
+    /\bfree trial\b/i,
+    /\bunlock (unlimited|full|access)\b/i,
+    /\blog ?in\b.*\bsubscribe\b/i,
+    /get full access/i,
+    /subscriber.only/i,
+    /continue with a free/i,
+    /registered in england/i,   // economist footer
+    /terms of use.*privacy/i,
+    /cookie policy/i,
+    /©.*newspaper/i,
+    /manage (cookies|account)/i,
+  ];
+
+  const lines = text.split('\n');
+  const clean = [];
+  let hitPaywall = false;
+
+  for (const raw of lines) {
+    const l = raw.trim();
+
+    // Stop at paywall signals
+    if (!hitPaywall && PAYWALL_SIGNALS.some(re => re.test(l))) {
+      hitPaywall = true;
+      break;
+    }
+
+    // Skip tracker image lines: ![...](https://tracking-url...)
+    if (/^!\[.*?\]\(https?:\/\//.test(l)) {
+      const urlMatch = l.match(/\(https?:\/\/([^)]+)\)/);
+      if (urlMatch && JUNK_DOMAINS.some(d => urlMatch[1].includes(d))) continue;
+      // Also skip any image that is clearly a tracker (no real alt text or tiny URL params)
+      if (/\?.*(&|=)/.test(l) && l.includes('track')) continue;
+    }
+
+    // Skip pure navigation link lists: lines that are only [text](url)
+    // with short text and site-internal links (no sentence content)
+    const linkOnly = /^\[([^\]]{1,40})\]\(https?:\/\/[^)]+\)$/.test(l);
+    if (linkOnly) {
+      // Allow if it looks like a citation/reference in prose, skip if nav-style
+      const inner = l.match(/^\[([^\]]+)\]/)?.[1] || '';
+      if (inner.split(' ').length <= 6) continue; // short label = nav link, skip
+    }
+
+    // Skip lines that are just a URL
+    if (/^https?:\/\/\S+$/.test(l)) continue;
+
+    // Skip lines with junk domains
+    if (JUNK_DOMAINS.some(d => l.includes(d))) continue;
+
+    // Skip markdown image lines with no meaningful alt (tracker pixels)
+    if (/^!\[Image \d+\]/.test(l)) continue;
+
+    clean.push(raw);
+  }
+
+  return clean.join('\n').trim();
+}
+
+// ─────────────────────────────────────────────
+// PARSE JINA RESPONSE → article object
+// ─────────────────────────────────────────────
 function parseJinaResponse(text, url) {
-  if (!text || text.length < 200) return null;
+  if (!text || text.length < 100) return null;
 
-  let title = '', byline = '', content = text;
-
-  // Jina returns: Title: ... \n URL: ... \n ... \n [article body]
+  let title = '', byline = '';
   const lines = text.split('\n');
   let bodyStart = 0;
 
-  for (let i = 0; i < Math.min(lines.length, 10); i++) {
-    const l = lines[i];
-    if (l.startsWith('Title:'))   { title = l.replace(/^Title:\s*/i, '').trim(); bodyStart = i + 1; }
-    if (l.startsWith('Author:') || l.startsWith('By ')) { byline = l.replace(/^(Author:|By )/i,'').trim(); }
-    if (l.startsWith('Published') || l.startsWith('Date:')) { byline += (byline?' · ':'')+l.replace(/^(Published[^:]*:|Date:)\s*/i,'').trim(); }
+  // Parse Jina header block (Title:, URL:, Published:, Author:)
+  for (let i = 0; i < Math.min(lines.length, 15); i++) {
+    const l = lines[i].trim();
+    if (/^Title:/i.test(l))     { title    = l.replace(/^Title:\s*/i,'').trim();  bodyStart = i+1; }
+    if (/^Author:/i.test(l))    { byline   = l.replace(/^Author:\s*/i,'').trim(); }
+    if (/^By\s+/i.test(l))      { byline   = l.replace(/^By\s+/i,'').trim(); }
+    if (/^Published/i.test(l))  { byline  += (byline?' · ':'')+l.replace(/^Published[^:]*:\s*/i,'').trim(); }
+    if (/^Date:/i.test(l))      { byline  += (byline?' · ':'')+l.replace(/^Date:\s*/i,'').trim(); }
   }
 
-  // Body is everything after the header block (first blank line after headers)
+  // Skip past blank lines after header
   for (let i = bodyStart; i < lines.length; i++) {
-    if (lines[i].trim() === '') { bodyStart = i + 1; break; }
+    if (lines[i].trim() === '') { bodyStart = i+1; break; }
   }
-  content = lines.slice(bodyStart).join('\n').trim();
-  if (!content || content.length < 150) content = text; // fallback: use full text
+
+  let content = cleanJinaContent(lines.slice(bodyStart).join('\n').trim());
+  if (!content || content.length < 100) {
+    content = cleanJinaContent(text);
+  }
 
   let site = url;
   try { site = new URL(url).hostname.replace('www.',''); } catch(e) {}
@@ -471,28 +556,32 @@ function parseJinaResponse(text, url) {
   return { title: title || 'Article', byline, site, content };
 }
 
-// Convert markdown to simple HTML paragraphs for display
+// ─────────────────────────────────────────────
+// MARKDOWN → HTML  (safe, no raw URLs rendered)
+// ─────────────────────────────────────────────
 function markdownToHtml(md) {
   const lines = md.split('\n');
-  let html = '';
-  let inList = false;
+  let html = '', inList = false;
 
   for (const raw of lines) {
     const l = raw.trim();
     if (!l) { if (inList) { html += '</ul>'; inList = false; } continue; }
 
-    if (l.startsWith('### ')) { html += `<h3>${esc(l.slice(4))}</h3>`; }
-    else if (l.startsWith('## ')) { html += `<h2>${esc(l.slice(3))}</h2>`; }
-    else if (l.startsWith('# '))  { html += `<h2>${esc(l.slice(2))}</h2>`; }
-    else if (l.startsWith('> '))  { html += `<blockquote>${esc(l.slice(2))}</blockquote>`; }
-    else if (/^[-*] /.test(l))   {
-      if (!inList) { html += '<ul>'; inList = true; }
-      html += `<li>${esc(l.slice(2))}</li>`;
-    }
-    else if (/^\d+\. /.test(l))  { html += `<p>${esc(l)}</p>`; }
+    // Skip any remaining tracker images or bare URLs that slipped through
+    if (/^!\[Image \d+\]/.test(l)) continue;
+    if (/^https?:\/\/\S+$/.test(l)) continue;
+
+    if (l.startsWith('### '))     { if(inList){html+='</ul>';inList=false;} html += `<h3>${esc(l.slice(4))}</h3>`; }
+    else if (l.startsWith('## ')) { if(inList){html+='</ul>';inList=false;} html += `<h2>${esc(l.slice(3))}</h2>`; }
+    else if (l.startsWith('# '))  { if(inList){html+='</ul>';inList=false;} html += `<h2>${esc(l.slice(2))}</h2>`; }
+    else if (l.startsWith('> '))  { if(inList){html+='</ul>';inList=false;} html += `<blockquote>${esc(l.slice(2))}</blockquote>`; }
+    else if (/^[-*] /.test(l))   { if(!inList){html+='<ul>';inList=true;} html += `<li>${esc(l.slice(2))}</li>`; }
+    else if (/^\d+\.\s/.test(l)) { if(inList){html+='</ul>';inList=false;} html += `<p>${esc(l)}</p>`; }
     else {
       if (inList) { html += '</ul>'; inList = false; }
-      html += `<p>${esc(l)}</p>`;
+      // Convert inline markdown links [text](url) → just text (no clickable links to nav)
+      const withLinks = l.replace(/\[([^\]]+)\]\(https?:\/\/[^)]+\)/g, '$1');
+      html += `<p>${esc(withLinks)}</p>`;
     }
   }
   if (inList) html += '</ul>';
@@ -500,10 +589,12 @@ function markdownToHtml(md) {
 }
 
 function esc(s) {
-  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
-          .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
-          .replace(/\*(.+?)\*/g,'<em>$1</em>')
-          .replace(/`(.+?)`/g,'<code>$1</code>');
+  // Escape HTML but preserve inline bold/italic
+  return s
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/\*\*(.+?)\*\*/g,'<strong>$1</strong>')
+    .replace(/\*(.+?)\*/g,'<em>$1</em>')
+    .replace(/`(.+?)`/g,'<code>$1</code>');
 }
 
 // ═══════════════════════════════════════════════
